@@ -11,7 +11,7 @@ from __future__ import absolute_import
 #
 #
 
-import Queue
+import queue
 import base64
 import hashlib
 import json
@@ -22,10 +22,16 @@ import sys
 import tempfile
 import threading
 import time
-import urllib2
+import urllib.request
+import io
 
 from Crypto import Random
 from Crypto.Cipher import AES
+
+
+def dprint(msg):
+    from pprint import pprint
+    pprint(msg)
 
 
 # Thanks to stackoverflow
@@ -34,7 +40,7 @@ from Crypto.Cipher import AES
 def derive_key_and_iv(password, salt, key_length, iv_length):
     d = d_i = ''
     while len(d) < key_length + iv_length:
-        d_i = hashlib.md5(d_i + password + salt).digest()
+        d_i = hashlib.sha512(d_i + password + salt).digest()
         d += d_i
     return d[:key_length], d[key_length:key_length + iv_length]
 
@@ -63,7 +69,7 @@ def decrypt(in_file, out_file, password, key_length=32):
 
 
 # A stupid way to calculate size of encrypted file and sha1
-# B2 requires a header with the sha1 but urllib2 must have the header before streaming
+# B2 requires a header with the sha1 but urllib must have the header before streaming
 # the data. This means we must read the file once to calculate the sha1, then read it again
 # for streaming the data on upload.
 def calc_encryption_sha_and_length(in_file, password, salt, key_length, key,
@@ -87,9 +93,9 @@ def calc_encryption_sha_and_length(in_file, password, salt, key_length, key,
     return sha.hexdigest(), size
 
 
-class Read2Encrypt(file):
+class Read2Encrypt(io.IOBase):
     """ Return encrypted data from read() calls
-        Override read() for urllib2 when streaming encrypted data (uploads)
+        Override read() for urllib when streaming encrypted data (uploads)
     """
 
     def __init__(self, path, mode, password, salt, key_length, key, iv, size=0,
@@ -141,21 +147,21 @@ class BackBlazeB2(object):
         self.upload_authorization_token = None
         self.valid_duration = valid_duration
         self.queue_size = mt_queue_size
-        self.upload_queue = Queue.Queue(maxsize=mt_queue_size)
+        self.upload_queue = queue.Queue(maxsize=mt_queue_size)
 
     def authorize_account(self):
         id_and_key = self.account_id + ':' + self.app_key
-        basic_auth_string = 'Basic ' + base64.b64encode(id_and_key)
+        basic_auth_string = "Basic " + base64.b64encode(id_and_key.encode('utf-8')).decode()
         headers = {'Authorization': basic_auth_string}
         try:
-            request = urllib2.Request(
+            request = urllib.request.Request(
                 'https://api.backblaze.com/b2api/v1/b2_authorize_account',
                 headers=headers
             )
-            response = urllib2.urlopen(request)
-            response_data = json.loads(response.read())
+            response = urllib.request.urlopen(request)
+            response_data = json.loads(response.read().decode())
             response.close()
-        except urllib2.HTTPError, error:
+        except urllib.request.HTTPError as error:
             print("ERROR: %s" % error.read())
             raise
 
@@ -214,6 +220,7 @@ class BackBlazeB2(object):
                 "create_bucket requires only _one_ argument and not both bucket_id and bucket_name")
 
         buckets = self.list_buckets()['buckets']
+
         if not bucket_id:
             key = 'bucketName'
             val = bucket_name
@@ -235,6 +242,9 @@ class BackBlazeB2(object):
                 "create_bucket requires only _one_ argument and not both bucket_id and bucket_name")
         self._authorize_account()
         bucket = self.get_bucket_info(bucket_id, bucket_name)
+        print("bucket")
+        dprint(bucket)
+        print("\n")
         return self._api_request('%s/b2api/v1/b2_delete_bucket' % self.api_url,
                                  {'accountId': self.account_id,
                                   'bucketId': bucket['bucketId']},
@@ -243,13 +253,12 @@ class BackBlazeB2(object):
     def get_upload_url(self, bucket_name, bucket_id):
         self._authorize_account()
         bucket = self.get_bucket_info(bucket_id, bucket_name)
-        bucket_id = bucket['bucketId']
         return self._api_request('%s/b2api/v1/b2_get_upload_url' % self.api_url,
-                                 {'bucketId': bucket_id},
+                                 {'bucketId': bucket['bucketId']},
                                  {'Authorization': self.authorization_token})
 
     # If password is set, encrypt files, else nah
-    def upload_file(self, path, password=None, bucket_id=None, bucket_name=None,
+    def upload_file(self, path, remoteName, password=None, bucket_id=None, bucket_name=None,
                     thread_upload_url=None,
                     thread_upload_authorization_token=None):
 
@@ -297,22 +306,23 @@ class BackBlazeB2(object):
         if " " in filename:
             filename = filename.replace(" ", "%20")
         # TODO: Figure out URL encoding issue
-        filename = unicode(filename, "utf-8")
+        filename = filename.encode('utf-8')
+        # filename = unicode(filename, "utf-8")
         headers = {
             'Authorization': cur_upload_authorization_token,
-            'X-Bz-File-Name': filename,
+            'X-Bz-File-Name': remoteName,
             'Content-Type': 'application/octet-stream',
             # 'Content-Type' : 'b2/x-auto',
             'X-Bz-Content-Sha1': sha
         }
         try:
             if password:
-                request = urllib2.Request(cur_upload_url, fp, headers)
+                request = urllib.request.Request(cur_upload_url, fp, headers)
             else:
-                request = urllib2.Request(cur_upload_url, mm_file_data, headers)
-            response = urllib2.urlopen(request)
-            response_data = json.loads(response.read())
-        except urllib2.HTTPError, error:
+                request = urllib.request.Request(cur_upload_url, mm_file_data, headers)
+            response = urllib.request.urlopen(request)
+            response_data = json.loads(response.read().decode('utf-8'))
+        except urllib.request.HTTPError as error:
             print("ERROR: %s" % error.read())
             raise
 
@@ -406,9 +416,9 @@ class BackBlazeB2(object):
             raise Exception(
                 "Destination file exists. Refusing to overwrite. "
                 "Set force=True if you wish to do so.")
-        request = urllib2.Request(
+        request = urllib.request.Request(
             url, None, {})
-        response = urllib2.urlopen(request)
+        response = urllib.request.urlopen(request)
 
         return BackBlazeB2.write_file(response, dst_file_name, password)
 
@@ -430,9 +440,9 @@ class BackBlazeB2(object):
             'Authorization': self.authorization_token
         }
 
-        request = urllib2.Request(
+        request = urllib.request.Request(
             url, None, headers)
-        response = urllib2.urlopen(request)
+        response = urllib.request.urlopen(request)
 
         return BackBlazeB2.write_file(response, dst_file_name, password)
 
@@ -445,9 +455,9 @@ class BackBlazeB2(object):
 
         self._authorize_account()
         url = self.download_url + '/b2api/v1/b2_download_file_by_id?fileId=' + file_id
-        request = urllib2.Request(url, None,
+        request = urllib.request.Request(url, None,
                                   {'Authorization': self.authorization_token})
-        resp = urllib2.urlopen(request)
+        resp = urllib.request.urlopen(request)
         return BackBlazeB2.write_file(resp, dst_file_name, password)
 
     def _upload_worker(self, password, bucket_id, bucket_name):
@@ -476,7 +486,7 @@ class BackBlazeB2(object):
                                      thread_upload_url=thread_upload_url,
                                      thread_upload_authorization_token=thread_upload_authorization_token)
                     break
-                except Exception, e:
+                except Exception as e:
                     print(
                     "WARNING: Error processing file '%s'\n%s\nTrying again." % (
                     path, e))
@@ -542,10 +552,17 @@ class BackBlazeB2(object):
         return nfiles
 
     def _api_request(self, url, data, headers):
+        print("url: ")
+        dprint(url)
+        print("data: ")
+        dprint(data)
+        print("headers: ")
+        dprint(headers)
+        print("\r\n")
         self._authorize_account()
-        request = urllib2.Request(url, json.dumps(data), headers)
-        response = urllib2.urlopen(request)
-        response_data = json.loads(response.read())
+        request = urllib.request.Request(url, json.dumps(data).encode('utf-8'), headers)
+        response = urllib.request.urlopen(request)
+        response_data = json.loads(response.read().decode('utf-8'))
         response.close()
         return response_data
 
